@@ -33,12 +33,12 @@ type Metrics struct {
 }
 
 var (
-	db             *sql.DB
-	cache          *CacheItem
-	cacheTTL       = 30 * time.Second
-	fakeDBDelay    = 200 * time.Millisecond
-	metrics        Metrics
-	reader          = bufio.NewReader(os.Stdin)
+	db          *sql.DB
+	cache       *CacheItem
+	cacheTTL    = 30 * time.Second
+	fakeDBDelay = 200 * time.Millisecond
+	metrics     Metrics
+	reader      = bufio.NewReader(os.Stdin)
 )
 
 func main() {
@@ -157,6 +157,7 @@ func fetchDirectlyFromDB() {
 
 func fetchUsingCache() {
 	start := time.Now()
+	wasExpired := false
 
 	if cache != nil {
 		if time.Now().Before(cache.ExpiresAt) {
@@ -171,6 +172,7 @@ func fetchUsingCache() {
 			return
 		}
 
+		wasExpired = true
 		metrics.ExpiredCacheHits++
 	}
 
@@ -190,7 +192,7 @@ func fetchUsingCache() {
 	metrics.TotalResponseTime += duration
 
 	cacheStatus := "MISS"
-	if metrics.ExpiredCacheHits > 0 {
+	if wasExpired {
 		cacheStatus = "EXPIRED"
 	}
 
