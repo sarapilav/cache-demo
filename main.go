@@ -24,12 +24,12 @@ type CacheItem struct {
 }
 
 type Metrics struct {
-	TotalRequests     int
-	DatabaseRequests  int
-	CacheHits         int
-	CacheMisses       int
-	ExpiredCacheHits  int
-	TotalResponseTime time.Duration
+	TotalReadRequests   int
+	DatabaseReadQueries int
+	CacheHits           int
+	CacheMisses         int
+	CacheExpirations    int
+	TotalResponseTime   time.Duration
 }
 
 var (
@@ -50,10 +50,15 @@ func main() {
 	}
 	defer db.Close()
 
+	if err := db.Ping(); err != nil {
+		log.Fatal(err)
+	}
+
 	setupDatabase()
 
 	fmt.Println("Cache Lab started.")
 	fmt.Println("This demo compares direct database fetching with cached fetching.")
+	fmt.Println("The cache is a single in-process teaching example, not a production cache.")
 	fmt.Println()
 
 	for {
@@ -112,14 +117,12 @@ func setupDatabase() {
 		name TEXT NOT NULL
 	);`
 
-	_, err := db.Exec(createTableQuery)
-	if err != nil {
+	if _, err := db.Exec(createTableQuery); err != nil {
 		log.Fatal(err)
 	}
 
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM pipelines").Scan(&count)
-	if err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM pipelines").Scan(&count); err != nil {
 		log.Fatal(err)
 	}
 
@@ -133,8 +136,7 @@ func setupDatabase() {
 		}
 
 		for _, name := range seedData {
-			_, err := db.Exec("INSERT INTO pipelines (name) VALUES (?)", name)
-			if err != nil {
+			if _, err := db.Exec("INSERT INTO pipelines (name) VALUES (?)", name); err != nil {
 				log.Fatal(err)
 			}
 		}
@@ -145,11 +147,10 @@ func fetchDirectlyFromDB() {
 	start := time.Now()
 
 	data := fetchPipelinesFromDB()
-
 	duration := time.Since(start)
 
-	metrics.TotalRequests++
-	metrics.DatabaseRequests++
+	metrics.TotalReadRequests++
+	metrics.DatabaseReadQueries++
 	metrics.TotalResponseTime += duration
 
 	printResult("DATABASE", "NONE", 1, duration, data)
@@ -158,12 +159,13 @@ func fetchDirectlyFromDB() {
 func fetchUsingCache() {
 	start := time.Now()
 	wasExpired := false
+	now := time.Now()
 
 	if cache != nil {
-		if time.Now().Before(cache.ExpiresAt) {
+		if now.Before(cache.ExpiresAt) {
 			duration := time.Since(start)
 
-			metrics.TotalRequests++
+			metrics.TotalReadRequests++
 			metrics.CacheHits++
 			metrics.TotalResponseTime += duration
 
@@ -173,22 +175,24 @@ func fetchUsingCache() {
 		}
 
 		wasExpired = true
-		metrics.ExpiredCacheHits++
+
+		metrics.CacheExpirations++
 	}
 
 	data := fetchPipelinesFromDB()
 
+	storedAt := time.Now()
 	cache = &CacheItem{
 		Data:      data,
-		StoredAt:  time.Now(),
-		ExpiresAt: time.Now().Add(cacheTTL),
+		StoredAt:  storedAt,
+		ExpiresAt: storedAt.Add(cacheTTL),
 	}
 
 	duration := time.Since(start)
 
-	metrics.TotalRequests++
+	metrics.TotalReadRequests++
 	metrics.CacheMisses++
-	metrics.DatabaseRequests++
+	metrics.DatabaseReadQueries++
 	metrics.TotalResponseTime += duration
 
 	cacheStatus := "MISS"
@@ -212,6 +216,7 @@ func fetchUsingCacheThreeTimes() {
 }
 
 func fetchPipelinesFromDB() []Pipeline {
+	// This delay is intentional and exists only to make the demo visible.
 	time.Sleep(fakeDBDelay)
 
 	rows, err := db.Query("SELECT id, name FROM pipelines ORDER BY id")
@@ -225,42 +230,56 @@ func fetchPipelinesFromDB() []Pipeline {
 	for rows.Next() {
 		var pipeline Pipeline
 
-		err := rows.Scan(&pipeline.ID, &pipeline.Name)
-		if err != nil {
+		if err := rows.Scan(&pipeline.ID, &pipeline.Name); err != nil {
 			log.Fatal(err)
 		}
 
 		pipelines = append(pipelines, pipeline)
 	}
 
+	if err := rows.Err(); err != nil {
+		log.Fatal(err)
+	}
+
 	return pipelines
 }
 
 func waitForTTL() {
-	fmt.Printf("Waiting %s for cache TTL to expire...\n", cacheTTL)
-	time.Sleep(cacheTTL + 1*time.Second)
+	if cache == nil {
+		fmt.Println("Cache is empty. There is no TTL to wait for.")
+		return
+	}
+
+	remaining := time.Until(cache.ExpiresAt)
+
+	if remaining <= 0 {
+		fmt.Println("Cache entry has already expired.")
+		return
+	}
+
+	wait := remaining + time.Second
+	fmt.Printf("Waiting %s for cache TTL to expire...\n", wait.Round(time.Second))
+	time.Sleep(wait)
 	fmt.Println("TTL expired. Try fetching with cache again.")
 }
 
 func updateDatabaseWithoutClearingCache() {
 	newName := fmt.Sprintf("New Pipeline %d", time.Now().Unix())
 
-	_, err := db.Exec("INSERT INTO pipelines (name) VALUES (?)", newName)
-	if err != nil {
+	if _, err := db.Exec("INSERT INTO pipelines (name) VALUES (?)", newName); err != nil {
 		log.Fatal(err)
 	}
 
 	fmt.Println("Database updated.")
 	fmt.Println("New pipeline added:", newName)
 	fmt.Println("Cache was NOT cleared.")
-	fmt.Println("If cache still has valid data, the next cached fetch may return old data.")
+	fmt.Println("If cache still has valid data, the next cached fetch may return stale data.")
 }
 
 func updateDatabaseAndClearCache() {
 	newName := fmt.Sprintf("Fresh Pipeline %d", time.Now().Unix())
 
-	_, err := db.Exec("INSERT INTO pipelines (name) VALUES (?)", newName)
-	if err != nil {
+	if _, err := db.Exec("INSERT INTO pipelines (name) VALUES (?)", newName); err != nil {
 		log.Fatal(err)
 	}
 
@@ -280,15 +299,15 @@ func clearCache() {
 func showMetrics() {
 	fmt.Println("METRICS SUMMARY")
 	fmt.Println("------------------------------------")
-	fmt.Printf("Total requests:      %d\n", metrics.TotalRequests)
-	fmt.Printf("Database requests:   %d\n", metrics.DatabaseRequests)
-	fmt.Printf("Cache hits:          %d\n", metrics.CacheHits)
-	fmt.Printf("Cache misses:        %d\n", metrics.CacheMisses)
-	fmt.Printf("Expired cache reads: %d\n", metrics.ExpiredCacheHits)
+	fmt.Printf("Total read requests:        %d\n", metrics.TotalReadRequests)
+	fmt.Printf("Database read queries:      %d\n", metrics.DatabaseReadQueries)
+	fmt.Printf("Cache hits:                 %d\n", metrics.CacheHits)
+	fmt.Printf("Cache misses:               %d\n", metrics.CacheMisses)
+	fmt.Printf("Expired entries encountered:%d\n", metrics.CacheExpirations)
 
-	if metrics.TotalRequests > 0 {
-		avg := metrics.TotalResponseTime / time.Duration(metrics.TotalRequests)
-		fmt.Printf("Average response:    %s\n", avg)
+	if metrics.TotalReadRequests > 0 {
+		avg := metrics.TotalResponseTime / time.Duration(metrics.TotalReadRequests)
+		fmt.Printf("Average read response:      %s\n", avg)
 	}
 
 	fmt.Println("------------------------------------")
